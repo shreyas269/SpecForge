@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
-from datasets import load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
@@ -86,7 +86,7 @@ def parse_args():
     )
 
     dataset_group = parser.add_argument_group("dataset")
-    dataset_group.add_argument("--train-data-path", type=str, required=True)
+    dataset_group.add_argument("--train-data-path", type=str, nargs="+", required=True)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
@@ -112,6 +112,14 @@ def parse_args():
         type=str,
         default=None,
         help="Directory of the checkpoint to resume training from",
+    )
+    training_group.add_argument(
+        "--reset-scheduler",
+        action="store_true",
+        help="When loading from --ckpt-dir, load optimizer Adam state (momentum) "
+        "but reset the LR scheduler for the new total_steps. "
+        "Useful for Phase 2 fine-tuning where you want to continue "
+        "optimizer momentum but start a fresh LR schedule.",
     )
 
     output_group = parser.add_argument_group("output")
@@ -194,19 +202,64 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     return target_model, draft_model
 
 
+def parse_data_path_with_fraction(raw_path: str) -> Tuple[str, float]:
+    """Parse a data path that may include a sampling fraction.
+
+    Supports the format: /path/to/data.jsonl::0.1
+    where 0.1 means use 10% of the dataset. Defaults to 1.0 (use all data).
+    """
+    if "::" in raw_path:
+        path, fraction_str = raw_path.rsplit("::", 1)
+        fraction = float(fraction_str)
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(
+                f"Sampling fraction must be in (0, 1], got {fraction} for {path}"
+            )
+        return path, fraction
+    return raw_path, 1.0
+
+
 def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
     """Build train and eval dataloaders."""
     import hashlib
 
     cache_params_string = (
-        f"{args.train_data_path}-"
+        f"{','.join(sorted(args.train_data_path))}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
         f"{args.target_model_path}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    # Parse paths and optional sampling fractions (e.g. "data.jsonl::0.1")
+    parsed_paths = [parse_data_path_with_fraction(p) for p in args.train_data_path]
+
+    arrow_entries = [(p, f) for p, f in parsed_paths if p.endswith(".arrow")]
+    json_entries = [(p, f) for p, f in parsed_paths if not p.endswith(".arrow")]
+
+    datasets_to_merge = []
+
+    for path, fraction in arrow_entries:
+        ds = Dataset.from_file(path)
+        if fraction < 1.0:
+            original_len = len(ds)
+            n_samples = max(1, int(original_len * fraction))
+            ds = ds.shuffle(seed=args.seed).select(range(n_samples))
+            print_on_rank0(f"Sampled {n_samples}/{original_len} ({fraction:.0%}) from {path}")
+        datasets_to_merge.append(ds)
+
+    if json_entries:
+        # Group json files, load each individually to apply per-file fractions
+        for path, fraction in json_entries:
+            ds = load_dataset("json", data_files=path)["train"]
+            if fraction < 1.0:
+                original_len = len(ds)
+                n_samples = max(1, int(original_len * fraction))
+                ds = ds.shuffle(seed=args.seed).select(range(n_samples))
+                print_on_rank0(f"Sampled {n_samples}/{original_len} ({fraction:.0%}) from {path}")
+            datasets_to_merge.append(ds)
+
+    train_dataset = concatenate_datasets(datasets_to_merge)
     train_eagle3_dataset = build_eagle3_dataset(
         dataset=train_dataset,
         tokenizer=tokenizer,
@@ -448,11 +501,19 @@ def main():
     start_epoch = 0
     global_step = 0
     if resume_state is not None:
-        optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
-        start_epoch = resume_state["epoch"]
-        global_step = resume_state["global_step"]
+        if args.reset_scheduler:
+            # Phase 2 fine-tuning: load Adam momentum but use fresh LR schedule
+            optimizer.optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+            print_on_rank0(
+                "Loaded optimizer Adam state (momentum) from checkpoint. "
+                "Scheduler reset for new training run."
+            )
+        else:
+            optimizer.load_state_dict(resume_state)
+            start_epoch = resume_state["epoch"]
+            global_step = resume_state["global_step"]
+            print_on_rank0(f"Restored optimizer and scheduler, lr={optimizer.get_learning_rate():.6f}")
         del resume_state
-        print_on_rank0(f"Restored scheduler, lr={optimizer.get_learning_rate():.6f}")
 
     skip_steps = global_step - start_epoch * len(train_dataloader)
 
