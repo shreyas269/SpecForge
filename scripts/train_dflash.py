@@ -598,6 +598,62 @@ def main():
                     }
                 )
 
+            if (
+                eval_dataloader is not None
+                and global_step % args.eval_interval == 0
+            ):
+                draft_model.eval()
+                eval_losses = []
+                eval_accs = []
+                eval_accept_lens = []
+
+                for eval_data in tqdm(
+                    eval_dataloader,
+                    desc=f"Evaluating Epoch {epoch}",
+                    disable=dist.get_rank() != 0,
+                ):
+                    with torch.no_grad():
+                        eval_input_ids = eval_data["input_ids"].cuda()
+                        eval_attention_mask = eval_data["attention_mask"].cuda()
+                        eval_loss_mask = eval_data["loss_mask"].cuda()
+                        eval_target_output = target_model.generate_dflash_data(
+                            eval_input_ids, eval_attention_mask, eval_loss_mask
+                        )
+                        eval_hidden_states = eval_target_output.hidden_states.cuda()
+
+                        eval_loss, eval_acc, eval_accept_len = dflash_model(
+                            input_ids=eval_input_ids,
+                            hidden_states=eval_hidden_states,
+                            loss_mask=eval_loss_mask,
+                        )
+                        eval_losses.append(eval_loss)
+                        eval_accs.append(eval_acc)
+                        eval_accept_lens.append(eval_accept_len)
+
+                avg_eval_loss = torch.stack(eval_losses).mean()
+                avg_eval_acc = torch.stack(eval_accs).mean()
+                avg_eval_accept_len = torch.stack(eval_accept_lens).mean()
+                dist.all_reduce(avg_eval_loss)
+                dist.all_reduce(avg_eval_acc)
+                dist.all_reduce(avg_eval_accept_len)
+                avg_eval_loss = avg_eval_loss / dist.get_world_size()
+                avg_eval_acc = avg_eval_acc / dist.get_world_size()
+                avg_eval_accept_len = avg_eval_accept_len / dist.get_world_size()
+
+                record_metrics(
+                    args,
+                    avg_eval_loss.item(),
+                    avg_eval_acc.item(),
+                    global_step,
+                    tracker,
+                    optimizer=None,
+                    train_dataloader=train_dataloader,
+                    mode="eval",
+                    acceptance_length=avg_eval_accept_len.item(),
+                )
+
+                draft_model.train()
+
             if global_step % args.save_interval == 0:
                 save_checkpoint(
                     args, epoch, global_step, dflash_model, draft_model, optimizer
