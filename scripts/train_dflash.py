@@ -363,6 +363,7 @@ def record_metrics(
     optimizer,
     train_dataloader=None,
     mode: str = "train",
+    acceptance_length: float = None,
 ) -> None:
     logdict = {}
 
@@ -371,9 +372,12 @@ def record_metrics(
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
+    if acceptance_length is not None:
+        logdict[f"{mode}/acceptance_length"] = acceptance_length
 
+    accept_str = f", AccLen: {acceptance_length:.2f}" if acceptance_length is not None else ""
     print_on_rank0(
-        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
+        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}{accept_str}"
     )
 
     tracker.log(logdict, step=global_step)
@@ -548,7 +552,7 @@ def main():
             )
             hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
-            loss, accuracy = dflash_model(
+            loss, accuracy, acceptance_length = dflash_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
@@ -562,10 +566,13 @@ def main():
             if global_step % args.log_interval == 0:
                 loss_log = loss.clone()
                 acc_log = accuracy.clone()
+                accept_len_log = acceptance_length.clone()
                 dist.all_reduce(loss_log)
                 dist.all_reduce(acc_log)
+                dist.all_reduce(accept_len_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
+                accept_len_log = accept_len_log / dist.get_world_size()
 
                 record_metrics(
                     args,
@@ -576,6 +583,7 @@ def main():
                     optimizer,
                     train_dataloader,
                     mode="train",
+                    acceptance_length=accept_len_log.item(),
                 )
 
             if dist.get_rank() == 0:
@@ -585,6 +593,7 @@ def main():
                     {
                         "loss": f"{loss.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
+                        "accept_len": f"{acceptance_length.item():.2f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
                 )

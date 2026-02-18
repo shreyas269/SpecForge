@@ -186,7 +186,7 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -269,11 +269,31 @@ class OnlineDFlashModel(nn.Module):
         valid_token_count = flat_weights.sum() + 1e-6
         loss = (loss_per_token * flat_weights).sum() / valid_token_count
 
-        # --- Accuracy ---
+        # --- Accuracy & Acceptance Length ---
         with torch.no_grad():
             pred_ids = torch.argmax(flat_logits, dim=-1)
             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
             actual_token_count = binary_eval_mask.sum() + 1e-6
             accuracy = correct.sum().float() / actual_token_count
 
-        return loss, accuracy
+            # Acceptance length: average consecutive correct predictions per block
+            # Reshape predictions back to [bsz, n_blocks, block_size]
+            n_blocks = anchor_positions.shape[1]
+            pred_block = pred_ids.view(bsz, n_blocks, self.block_size)
+            target_block = flat_targets.view(bsz, n_blocks, self.block_size)
+            eval_mask_block = binary_eval_mask.view(bsz, n_blocks, self.block_size)
+
+            # Match from position 1 onward (position 0 is the anchor, excluded)
+            matches = (pred_block[:, :, 1:] == target_block[:, :, 1:])
+            valid = eval_mask_block[:, :, 1:] > 0.5
+            # Where invalid, treat as mismatch to stop counting
+            matches = matches & valid
+            # Consecutive correct from start of prediction: cumprod stops at first 0
+            # +1 for the bonus token (target model sample at rejection point)
+            accept_len_per_block = matches.float().cumprod(dim=-1).sum(dim=-1) + 1  # [bsz, n_blocks]
+            # Only average over valid blocks
+            valid_blocks = block_keep_mask.float()
+            num_valid_blocks = valid_blocks.sum() + 1e-6
+            acceptance_length = (accept_len_per_block * valid_blocks).sum() / num_valid_blocks
+
+        return loss, accuracy, acceptance_length
