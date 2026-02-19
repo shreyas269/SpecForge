@@ -306,7 +306,20 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
 
     eval_dataloader = None
     if args.eval_data_path:
-        eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
+        eval_path = args.eval_data_path
+        if eval_path.endswith(".arrow"):
+            eval_dataset = Dataset.from_file(eval_path)
+        elif os.path.isdir(eval_path):
+            loaded = load_dataset(eval_path)
+            if "test" in loaded:
+                eval_dataset = loaded["test"]
+            else:
+                raise ValueError(
+                    f"Eval data directory {eval_path} does not contain a 'test' split. "
+                    f"Available splits: {list(loaded.keys())}"
+                )
+        else:
+            eval_dataset = load_dataset("json", data_files=eval_path)["train"]
         eval_eagle3_dataset = build_eagle3_dataset(
             dataset=eval_dataset,
             tokenizer=tokenizer,
