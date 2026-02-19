@@ -234,12 +234,16 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     # Parse paths and optional sampling fractions (e.g. "data.jsonl::0.1")
     parsed_paths = [parse_data_path_with_fraction(p) for p in args.train_data_path]
 
-    arrow_entries = [(p, f) for p, f in parsed_paths if p.endswith(".arrow")]
-    json_entries = [(p, f) for p, f in parsed_paths if not p.endswith(".arrow")]
+    arrow_file_entries = [(p, f) for p, f in parsed_paths if p.endswith(".arrow")]
+    arrow_dir_entries = [(p, f) for p, f in parsed_paths if os.path.isdir(p)]
+    json_entries = [
+        (p, f) for p, f in parsed_paths
+        if not p.endswith(".arrow") and not os.path.isdir(p)
+    ]
 
     datasets_to_merge = []
 
-    for path, fraction in arrow_entries:
+    for path, fraction in arrow_file_entries:
         ds = Dataset.from_file(path)
         if fraction < 1.0:
             original_len = len(ds)
@@ -248,16 +252,28 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             print_on_rank0(f"Sampled {n_samples}/{original_len} ({fraction:.0%}) from {path}")
         datasets_to_merge.append(ds)
 
-    if json_entries:
-        # Group json files, load each individually to apply per-file fractions
-        for path, fraction in json_entries:
-            ds = load_dataset("json", data_files=path)["train"]
-            if fraction < 1.0:
-                original_len = len(ds)
-                n_samples = max(1, int(original_len * fraction))
-                ds = ds.shuffle(seed=args.seed).select(range(n_samples))
-                print_on_rank0(f"Sampled {n_samples}/{original_len} ({fraction:.0%}) from {path}")
-            datasets_to_merge.append(ds)
+    for path, fraction in arrow_dir_entries:
+        loaded = load_dataset(path)
+        # Use train split if available, otherwise take the first split
+        if "train" in loaded:
+            ds = loaded["train"]
+        else:
+            ds = next(iter(loaded.values()))
+        if fraction < 1.0:
+            original_len = len(ds)
+            n_samples = max(1, int(original_len * fraction))
+            ds = ds.shuffle(seed=args.seed).select(range(n_samples))
+            print_on_rank0(f"Sampled {n_samples}/{original_len} ({fraction:.0%}) from {path}")
+        datasets_to_merge.append(ds)
+
+    for path, fraction in json_entries:
+        ds = load_dataset("json", data_files=path)["train"]
+        if fraction < 1.0:
+            original_len = len(ds)
+            n_samples = max(1, int(original_len * fraction))
+            ds = ds.shuffle(seed=args.seed).select(range(n_samples))
+            print_on_rank0(f"Sampled {n_samples}/{original_len} ({fraction:.0%}) from {path}")
+        datasets_to_merge.append(ds)
 
     train_dataset = concatenate_datasets(datasets_to_merge)
     train_eagle3_dataset = build_eagle3_dataset(
