@@ -327,6 +327,13 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             max_length=args.max_length,
             is_preformatted=args.is_preformatted,
         )
+        eval_original_size = len(eval_eagle3_dataset)
+        eval_eagle3_dataset = eval_eagle3_dataset.filter(
+            lambda x: x["loss_mask"].sum() >= min_loss_tokens
+        )
+        print_on_rank0(
+            f"Filtered eval dataset: {eval_original_size} -> {len(eval_eagle3_dataset)} samples"
+        )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.batch_size,
