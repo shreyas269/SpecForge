@@ -241,7 +241,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         if not p.endswith(".arrow") and not os.path.isdir(p)
     ]
 
-    datasets_to_merge = []
+    raw_datasets = []
 
     for path, fraction in arrow_file_entries:
         ds = Dataset.from_file(path)
@@ -250,7 +250,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             n_samples = max(1, int(original_len * fraction))
             ds = ds.shuffle(seed=args.seed).select(range(n_samples))
             print_on_rank0(f"Sampled {n_samples}/{original_len} ({fraction:.0%}) from {path}")
-        datasets_to_merge.append(ds)
+        raw_datasets.append(ds)
 
     for path, fraction in arrow_dir_entries:
         loaded = load_dataset(path)
@@ -264,7 +264,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             n_samples = max(1, int(original_len * fraction))
             ds = ds.shuffle(seed=args.seed).select(range(n_samples))
             print_on_rank0(f"Sampled {n_samples}/{original_len} ({fraction:.0%}) from {path}")
-        datasets_to_merge.append(ds)
+        raw_datasets.append(ds)
 
     for path, fraction in json_entries:
         ds = load_dataset("json", data_files=path)["train"]
@@ -273,19 +273,28 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             n_samples = max(1, int(original_len * fraction))
             ds = ds.shuffle(seed=args.seed).select(range(n_samples))
             print_on_rank0(f"Sampled {n_samples}/{original_len} ({fraction:.0%}) from {path}")
-        datasets_to_merge.append(ds)
+        raw_datasets.append(ds)
 
-    train_dataset = concatenate_datasets(datasets_to_merge)
-    train_eagle3_dataset = build_eagle3_dataset(
-        dataset=train_dataset,
-        tokenizer=tokenizer,
-        chat_template=args.chat_template,
-        max_length=args.max_length,
-        is_preformatted=args.is_preformatted,
-        cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-        cache_key=cache_key,
-        num_proc=args.build_dataset_num_proc,
-    )
+    # Preprocess each dataset separately (they may have different schemas),
+    # then concatenate the processed results.
+    processed_datasets = []
+    for i, ds in enumerate(raw_datasets):
+        ds_cache_key = f"{cache_key}_part{i}" if cache_key else None
+        ds_cache_dir = os.path.join(args.cache_dir, "processed_dataset") if cache_key else None
+        processed = build_eagle3_dataset(
+            dataset=ds,
+            tokenizer=tokenizer,
+            chat_template=args.chat_template,
+            max_length=args.max_length,
+            is_preformatted=args.is_preformatted,
+            cache_dir=ds_cache_dir,
+            cache_key=ds_cache_key,
+            num_proc=args.build_dataset_num_proc,
+        )
+        print_on_rank0(f"Preprocessed dataset {i}: {len(processed)} samples")
+        processed_datasets.append(processed)
+
+    train_eagle3_dataset = concatenate_datasets(processed_datasets)
 
     min_loss_tokens = 2 * args.block_size
     original_size = len(train_eagle3_dataset)

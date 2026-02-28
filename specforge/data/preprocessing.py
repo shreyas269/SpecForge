@@ -376,14 +376,19 @@ def build_eagle3_dataset(
                 train_only_last_turn=train_only_last_turn,
             )
         else:
-            # Handle ShareGPT conversations
-            if "conversations" not in examples:
+            # Handle conversations — accept either "messages" or "conversations" column.
+            if "messages" in examples:
+                conv_col = "messages"
+            elif "conversations" in examples:
+                conv_col = "conversations"
+            else:
                 raise ValueError(
-                    f"Expected 'conversations' column for is_preformatted=False, but found columns: {list(examples.keys())}"
+                    f"Expected a 'messages' or 'conversations' column for is_preformatted=False, "
+                    f"but found columns: {list(examples.keys())}"
                 )
-            conversations = examples.pop("conversations")
-            if "id" in examples:
-                examples.pop("id")
+            conversations = examples.pop(conv_col)
+            for key in ("id", "ids", "uuid", "idx"):
+                examples.pop(key, None)
             processed = preprocess_conversations(
                 tokenizer,
                 conversations,
