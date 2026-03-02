@@ -403,18 +403,21 @@ def build_eagle3_dataset(
 
     # Process dataset only once
     if cache_dir and cache_key:
-        load_from_cache_file = True
         os.makedirs(cache_dir, exist_ok=True)
         cache_file_name = os.path.join(cache_dir, f"{cache_key}.pkl")
-        print(f"dataset is cached at {cache_file_name}")
-    elif cache_dir is None and cache_key is None:
-        load_from_cache_file = False
-        cache_file_name = None
-        print(f"dataset is not cached")
+        if os.path.exists(cache_file_name):
+            print(f"Loading cached dataset from {cache_file_name}")
+            from datasets import Dataset as _Dataset
+            dataset = _Dataset.load_from_disk(cache_file_name)
+            dataset.set_format(type="torch")
+            return dataset
+        print(f"Will cache dataset at {cache_file_name}")
     else:
-        warnings.warn(
-            f"cache_dir and cache_key must be provided together to make caching work"
-        )
+        cache_file_name = None
+        if cache_dir is not None or cache_key is not None:
+            warnings.warn(
+                f"cache_dir and cache_key must be provided together to make caching work"
+            )
 
     # adjust batch size based on dataset type
     if is_vlm:
@@ -429,10 +432,12 @@ def build_eagle3_dataset(
         num_proc=num_proc,
         batch_size=batch_size,
         remove_columns=original_cols,
-        # keep_in_memory=True,
-        load_from_cache_file=load_from_cache_file,
-        cache_file_name=cache_file_name,
+        load_from_cache_file=False,
     )
+
+    if cache_file_name:
+        dataset.save_to_disk(cache_file_name)
+        print(f"Saved cached dataset to {cache_file_name}")
 
     dataset.set_format(type="torch")
     return dataset
