@@ -13,7 +13,7 @@ ready for use with is_preformatted=True.
 import argparse
 from pathlib import Path
 
-from datasets import Dataset, concatenate_datasets, load_from_disk
+from datasets import Dataset, concatenate_datasets
 from transformers import AutoTokenizer
 
 
@@ -70,7 +70,7 @@ def merge_datasets(dataset_configs: list[dict], tokenizer) -> Dataset:
 
     Args:
         dataset_configs: list of dicts with keys:
-            - path: str, path to arrow dataset on disk
+            - path: str, path to arrow file on disk
             - format: str, one of "sharegpt" or "ultrachat"
         tokenizer: tokenizer with chat template for formatting conversations
     """
@@ -82,7 +82,7 @@ def merge_datasets(dataset_configs: list[dict], tokenizer) -> Dataset:
         fmt = config["format"]
 
         print(f"Loading {path} (format: {fmt})...")
-        ds = load_from_disk(path)
+        ds = Dataset.from_file(path)
         print(f"  Loaded {len(ds)} examples with columns: {ds.column_names}")
 
         normalizer = NORMALIZERS[fmt]
@@ -103,7 +103,7 @@ def main():
         "--datasets",
         nargs="+",
         required=True,
-        help="Dataset specs as 'path:format' pairs, e.g. /data/sharegpt:sharegpt /data/ultrachat:ultrachat",
+        help="Dataset specs as 'path:format' pairs, e.g. /data/sharegpt.arrow:sharegpt /data/ultrachat.arrow:ultrachat",
     )
     parser.add_argument("--output", required=True, help="Output path for merged dataset")
     parser.add_argument(
