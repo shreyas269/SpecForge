@@ -4,6 +4,7 @@
 
 import argparse
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -219,6 +220,39 @@ def parse_data_path_with_fraction(raw_path: str) -> Tuple[str, float]:
     return raw_path, 1.0
 
 
+def load_dataset_from_dir(path: str) -> Dataset:
+    """Load a dataset directory by reading state.json _data_files for fast arrow loading.
+
+    Falls back to load_dataset() if no state.json is found.
+    """
+    state_json_path = os.path.join(path, "state.json")
+    if os.path.exists(state_json_path):
+        with open(state_json_path, "r") as f:
+            state = json.load(f)
+        data_files = state.get("_data_files", [])
+        if data_files:
+            arrow_paths = [
+                os.path.join(path, entry["filename"])
+                for entry in data_files
+                if os.path.exists(os.path.join(path, entry["filename"]))
+            ]
+            if arrow_paths:
+                datasets = [Dataset.from_file(p) for p in arrow_paths]
+                ds = concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
+                print_on_rank0(
+                    f"Loaded {len(arrow_paths)} arrow file(s) from {path} via state.json"
+                )
+                return ds
+        print_on_rank0(
+            f"state.json found in {path} but no valid _data_files, falling back to load_dataset"
+        )
+
+    loaded = load_dataset(path)
+    if "train" in loaded:
+        return loaded["train"]
+    return next(iter(loaded.values()))
+
+
 def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
     """Build train and eval dataloaders."""
     import hashlib
@@ -253,12 +287,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         raw_datasets.append(ds)
 
     for path, fraction in arrow_dir_entries:
-        loaded = load_dataset(path)
-        # Use train split if available, otherwise take the first split
-        if "train" in loaded:
-            ds = loaded["train"]
-        else:
-            ds = next(iter(loaded.values()))
+        ds = load_dataset_from_dir(path)
         if fraction < 1.0:
             original_len = len(ds)
             n_samples = max(1, int(original_len * fraction))
@@ -319,14 +348,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         if eval_path.endswith(".arrow"):
             eval_dataset = Dataset.from_file(eval_path)
         elif os.path.isdir(eval_path):
-            loaded = load_dataset(eval_path)
-            if "test" in loaded:
-                eval_dataset = loaded["test"]
-            else:
-                raise ValueError(
-                    f"Eval data directory {eval_path} does not contain a 'test' split. "
-                    f"Available splits: {list(loaded.keys())}"
-                )
+            eval_dataset = load_dataset_from_dir(eval_path)
         else:
             eval_dataset = load_dataset("json", data_files=eval_path)["train"]
         eval_eagle3_dataset = build_eagle3_dataset(
