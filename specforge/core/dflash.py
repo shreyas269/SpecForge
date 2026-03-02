@@ -4,7 +4,6 @@
 from typing import Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -267,14 +266,8 @@ class OnlineDFlashModel(nn.Module):
         flat_weights = weight_mask.view(-1)
 
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        weighted_loss_sum = (loss_per_token * flat_weights).sum()
-        valid_token_count = flat_weights.sum()
-
-        if dist.is_initialized():
-            dist.all_reduce(weighted_loss_sum)
-            dist.all_reduce(valid_token_count)
-
-        loss = weighted_loss_sum / (valid_token_count + 1e-6)
+        valid_token_count = flat_weights.sum() + 1e-6
+        loss = (loss_per_token * flat_weights).sum() / valid_token_count
 
         # --- Accuracy & Acceptance Length ---
         with torch.no_grad():
