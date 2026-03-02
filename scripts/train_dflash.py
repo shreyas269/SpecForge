@@ -3,8 +3,8 @@
 """DFlash Training Script."""
 
 import argparse
+import contextlib
 import logging
-import math
 import os
 import shutil
 import time
@@ -354,7 +354,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     return train_dataloader, eval_dataloader
 
 
-def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
+def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer, total_micro_steps=0):
     """Save checkpoint."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
     if dist.get_rank() == 0:
@@ -374,6 +374,7 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
                 {
                     "epoch": epoch,
                     "global_step": step,
+                    "total_micro_steps": total_micro_steps,
                     "args": args,
                     **optimizer.state_dict(),
                 },
@@ -404,9 +405,9 @@ def record_metrics(
     loss: float,
     accuracy: float,
     global_step: int,
+    total_steps: int,
     tracker,
     optimizer,
-    train_dataloader=None,
     mode: str = "train",
     acceptance_length: float = None,
 ) -> None:
@@ -422,7 +423,7 @@ def record_metrics(
 
     accept_str = f", AccLen: {acceptance_length:.2f}" if acceptance_length is not None else ""
     print_on_rank0(
-        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}{accept_str}"
+        f"{mode.capitalize()} - Step {global_step}/{total_steps}, Loss: {loss:.4f}, Acc: {accuracy:.4f}{accept_str}"
     )
 
     tracker.log(logdict, step=global_step)
@@ -504,8 +505,7 @@ def main():
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
 
-    steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
-    total_steps = args.num_epochs * steps_per_epoch
+    total_steps = (args.num_epochs * len(train_dataloader)) // args.accumulation_steps
     print_on_rank0(f"Total training steps: {total_steps}")
 
     print_on_rank0("Loading target embeddings and head...")
@@ -534,6 +534,7 @@ def main():
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )
@@ -549,6 +550,7 @@ def main():
 
     start_epoch = 0
     global_step = 0
+    total_micro_steps = 0
     if resume_state is not None:
         if args.reset_scheduler:
             # Phase 2 fine-tuning: load Adam momentum but use fresh LR schedule
@@ -561,16 +563,20 @@ def main():
             optimizer.load_state_dict(resume_state)
             start_epoch = resume_state["epoch"]
             global_step = resume_state["global_step"]
+            total_micro_steps = resume_state.get(
+                "total_micro_steps", global_step * args.accumulation_steps
+            )
             print_on_rank0(f"Restored optimizer and scheduler, lr={optimizer.get_learning_rate():.6f}")
         del resume_state
 
-    skip_steps = global_step - start_epoch * len(train_dataloader)
+    skip_steps = total_micro_steps - start_epoch * len(train_dataloader)
 
     print_on_rank0(f"Initializing tracker (report_to={args.report_to})...")
     tracker = create_tracker(args, args.output_dir)
     print_on_rank0("Tracker initialized successfully.")
 
     last_time = time.time()
+    micro_step = 0  # accumulation counter, spans epoch boundaries
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -587,7 +593,8 @@ def main():
         for step_in_epoch, data in enumerate(progress_bar):
             if epoch == start_epoch and step_in_epoch < skip_steps:
                 continue
-            global_step += 1
+            total_micro_steps += 1
+            micro_step += 1
 
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
@@ -603,33 +610,10 @@ def main():
                 loss_mask=loss_mask,
             )
 
-            (loss / args.accumulation_steps).backward()
-
-            if global_step % args.accumulation_steps == 0:
-                optimizer.step()
-
-            if global_step % args.log_interval == 0:
-                loss_log = loss.clone()
-                acc_log = accuracy.clone()
-                accept_len_log = acceptance_length.clone()
-                dist.all_reduce(loss_log)
-                dist.all_reduce(acc_log)
-                dist.all_reduce(accept_len_log)
-                loss_log = loss_log / dist.get_world_size()
-                acc_log = acc_log / dist.get_world_size()
-                accept_len_log = accept_len_log / dist.get_world_size()
-
-                record_metrics(
-                    args,
-                    loss_log.item(),
-                    acc_log.item(),
-                    global_step,
-                    tracker,
-                    optimizer,
-                    train_dataloader,
-                    mode="train",
-                    acceptance_length=accept_len_log.item(),
-                )
+            is_accumulating = micro_step % args.accumulation_steps != 0
+            sync_context = dflash_model.no_sync if is_accumulating else contextlib.nullcontext
+            with sync_context():
+                (loss / args.accumulation_steps).backward()
 
             if dist.get_rank() == 0:
                 elapsed = time.time() - last_time
@@ -643,69 +627,103 @@ def main():
                     }
                 )
 
-            if (
-                eval_dataloader is not None
-                and global_step % args.eval_interval == 0
-            ):
-                draft_model.eval()
-                eval_losses = []
-                eval_accs = []
-                eval_accept_lens = []
+            if not is_accumulating:
+                optimizer.step()
+                global_step += 1
+                micro_step = 0
 
-                for eval_data in tqdm(
-                    eval_dataloader,
-                    desc=f"Evaluating Epoch {epoch}",
-                    disable=dist.get_rank() != 0,
+                if global_step % args.log_interval == 0:
+                    dp_group = get_dp_group()
+                    dp_world_size = dist.get_world_size(dp_group)
+                    loss_log = loss.clone()
+                    acc_log = accuracy.clone()
+                    accept_len_log = acceptance_length.clone()
+                    dist.all_reduce(loss_log, group=dp_group)
+                    dist.all_reduce(acc_log, group=dp_group)
+                    dist.all_reduce(accept_len_log, group=dp_group)
+                    loss_log = loss_log / dp_world_size
+                    acc_log = acc_log / dp_world_size
+                    accept_len_log = accept_len_log / dp_world_size
+
+                    record_metrics(
+                        args,
+                        loss_log.item(),
+                        acc_log.item(),
+                        global_step,
+                        total_steps,
+                        tracker,
+                        optimizer,
+                        mode="train",
+                        acceptance_length=accept_len_log.item(),
+                    )
+
+                if (
+                    eval_dataloader is not None
+                    and global_step % args.eval_interval == 0
                 ):
-                    with torch.no_grad():
-                        eval_input_ids = eval_data["input_ids"].cuda()
-                        eval_attention_mask = eval_data["attention_mask"].cuda()
-                        eval_loss_mask = eval_data["loss_mask"].cuda()
-                        eval_target_output = target_model.generate_dflash_data(
-                            eval_input_ids, eval_attention_mask, eval_loss_mask
-                        )
-                        eval_hidden_states = eval_target_output.hidden_states.cuda()
+                    draft_model.eval()
+                    eval_losses = []
+                    eval_accs = []
+                    eval_accept_lens = []
 
-                        eval_loss, eval_acc, eval_accept_len = dflash_model(
-                            input_ids=eval_input_ids,
-                            hidden_states=eval_hidden_states,
-                            loss_mask=eval_loss_mask,
-                        )
-                        eval_losses.append(eval_loss)
-                        eval_accs.append(eval_acc)
-                        eval_accept_lens.append(eval_accept_len)
+                    for eval_data in tqdm(
+                        eval_dataloader,
+                        desc=f"Evaluating Epoch {epoch}",
+                        disable=dist.get_rank() != 0,
+                    ):
+                        with torch.no_grad():
+                            eval_input_ids = eval_data["input_ids"].cuda()
+                            eval_attention_mask = eval_data["attention_mask"].cuda()
+                            eval_loss_mask = eval_data["loss_mask"].cuda()
+                            eval_target_output = target_model.generate_dflash_data(
+                                eval_input_ids, eval_attention_mask, eval_loss_mask
+                            )
+                            eval_hidden_states = eval_target_output.hidden_states.cuda()
 
-                avg_eval_loss = torch.stack(eval_losses).mean()
-                avg_eval_acc = torch.stack(eval_accs).mean()
-                avg_eval_accept_len = torch.stack(eval_accept_lens).mean()
-                dist.all_reduce(avg_eval_loss)
-                dist.all_reduce(avg_eval_acc)
-                dist.all_reduce(avg_eval_accept_len)
-                avg_eval_loss = avg_eval_loss / dist.get_world_size()
-                avg_eval_acc = avg_eval_acc / dist.get_world_size()
-                avg_eval_accept_len = avg_eval_accept_len / dist.get_world_size()
+                            eval_loss, eval_acc, eval_accept_len = dflash_model(
+                                input_ids=eval_input_ids,
+                                hidden_states=eval_hidden_states,
+                                loss_mask=eval_loss_mask,
+                            )
+                            eval_losses.append(eval_loss)
+                            eval_accs.append(eval_acc)
+                            eval_accept_lens.append(eval_accept_len)
 
-                record_metrics(
-                    args,
-                    avg_eval_loss.item(),
-                    avg_eval_acc.item(),
-                    global_step,
-                    tracker,
-                    optimizer=None,
-                    train_dataloader=train_dataloader,
-                    mode="eval",
-                    acceptance_length=avg_eval_accept_len.item(),
-                )
+                    avg_eval_loss = torch.stack(eval_losses).mean()
+                    avg_eval_acc = torch.stack(eval_accs).mean()
+                    avg_eval_accept_len = torch.stack(eval_accept_lens).mean()
+                    dp_group = get_dp_group()
+                    dp_world_size = dist.get_world_size(dp_group)
+                    dist.all_reduce(avg_eval_loss, group=dp_group)
+                    dist.all_reduce(avg_eval_acc, group=dp_group)
+                    dist.all_reduce(avg_eval_accept_len, group=dp_group)
+                    avg_eval_loss = avg_eval_loss / dp_world_size
+                    avg_eval_acc = avg_eval_acc / dp_world_size
+                    avg_eval_accept_len = avg_eval_accept_len / dp_world_size
 
-                draft_model.train()
+                    record_metrics(
+                        args,
+                        avg_eval_loss.item(),
+                        avg_eval_acc.item(),
+                        global_step,
+                        total_steps,
+                        tracker,
+                        optimizer=None,
+                        mode="eval",
+                        acceptance_length=avg_eval_accept_len.item(),
+                    )
 
-            if global_step % args.save_interval == 0:
-                save_checkpoint(
-                    args, epoch, global_step, dflash_model, draft_model, optimizer
-                )
+                    draft_model.train()
+
+                if global_step % args.save_interval == 0:
+                    save_checkpoint(
+                        args, epoch, global_step, dflash_model, draft_model, optimizer,
+                        total_micro_steps=total_micro_steps,
+                    )
 
     save_checkpoint(
-        args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
+        args, args.num_epochs, global_step, dflash_model, draft_model, optimizer,
+        total_micro_steps=total_micro_steps,
     )
 
     tracker.close()
