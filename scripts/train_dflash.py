@@ -591,19 +591,29 @@ def main():
             print_on_rank0(f"Restored optimizer and scheduler, lr={optimizer.get_learning_rate():.6f}")
         del resume_state
 
-    skip_steps = total_micro_steps - start_epoch * len(train_dataloader)
+    skip_steps = max(0, total_micro_steps - start_epoch * len(train_dataloader))
 
     print_on_rank0(f"Initializing tracker (report_to={args.report_to})...")
     tracker = create_tracker(args, args.output_dir)
     print_on_rank0("Tracker initialized successfully.")
 
     last_time = time.time()
-    micro_step = 0  # accumulation counter, spans epoch boundaries
+    accum_loss = 0.0  # running sum of loss across accumulation window
+    accum_acc = 0.0
+    accum_accept_len = 0.0
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
 
+    micro_step = 0
     for epoch in range(start_epoch, args.num_epochs):
         train_dataloader.sampler.set_epoch(epoch)
-        draft_model.train()
+        # Discard any partial accumulation from previous epoch
+        if micro_step != 0:
+            dflash_model.zero_grad(set_to_none=True)
+            micro_step = 0
+            accum_loss = 0.0
+            accum_acc = 0.0
+            accum_accept_len = 0.0
+        dflash_model.train()
 
         if dist.get_rank() == 0:
             progress_bar = tqdm(
@@ -632,6 +642,10 @@ def main():
                 loss_mask=loss_mask,
             )
 
+            accum_loss += loss.detach() / args.accumulation_steps
+            accum_acc += accuracy.detach() / args.accumulation_steps
+            accum_accept_len += acceptance_length.detach() / args.accumulation_steps
+
             is_accumulating = micro_step % args.accumulation_steps != 0
             sync_context = dflash_model.no_sync if is_accumulating else contextlib.nullcontext
             with sync_context():
@@ -657,9 +671,9 @@ def main():
                 if global_step % args.log_interval == 0:
                     dp_group = get_dp_group()
                     dp_world_size = dist.get_world_size(dp_group)
-                    loss_log = loss.clone()
-                    acc_log = accuracy.clone()
-                    accept_len_log = acceptance_length.clone()
+                    loss_log = accum_loss.clone()
+                    acc_log = accum_acc.clone()
+                    accept_len_log = accum_accept_len.clone()
                     dist.all_reduce(loss_log, group=dp_group)
                     dist.all_reduce(acc_log, group=dp_group)
                     dist.all_reduce(accept_len_log, group=dp_group)
@@ -683,7 +697,7 @@ def main():
                     eval_dataloader is not None
                     and global_step % args.eval_interval == 0
                 ):
-                    draft_model.eval()
+                    dflash_model.eval()
                     eval_losses = []
                     eval_accs = []
                     eval_accept_lens = []
@@ -735,13 +749,17 @@ def main():
                         acceptance_length=avg_eval_accept_len.item(),
                     )
 
-                    draft_model.train()
+                    dflash_model.train()
 
                 if global_step % args.save_interval == 0:
                     save_checkpoint(
                         args, epoch, global_step, dflash_model, draft_model, optimizer,
                         total_micro_steps=total_micro_steps,
                     )
+
+                accum_loss = 0.0
+                accum_acc = 0.0
+                accum_accept_len = 0.0
 
     save_checkpoint(
         args, args.num_epochs, global_step, dflash_model, draft_model, optimizer,
