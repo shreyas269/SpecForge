@@ -32,6 +32,7 @@ import json
 import os
 import random
 from concurrent.futures import ThreadPoolExecutor
+
 from typing import Any, Dict, List
 
 from openai import OpenAI
@@ -99,6 +100,18 @@ def parse_arguments():
         default=64,
         help="The number of requests to send to a single server concurrently, the total number of concurrent requests is concurrency * number of server addresses",
     )
+    optimization_group.add_argument(
+        "--max-context-words",
+        type=int,
+        default=100000,
+        help="Skip conversations exceeding this estimated word count to prevent OOM",
+    )
+    optimization_group.add_argument(
+        "--request-timeout",
+        type=float,
+        default=300.0,
+        help="Timeout in seconds for each API request",
+    )
 
     # data related arguments
     data_group = parser.add_argument_group("data")
@@ -118,6 +131,13 @@ def parse_arguments():
         "--resume",
         action="store_true",
         help="Resume from existing output file, skip already processed samples",
+    )
+    data_group.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Retry previously failed samples from the error file. "
+        "Reads from <output>_error.jsonl, appends successes to <output>.jsonl, "
+        "and writes remaining failures to <output>_error.jsonl (replacing it).",
     )
 
     # sglang server
@@ -195,7 +215,11 @@ def call_sglang(
     max_tokens=None,
 ) -> str:
     """Send a batch of prompts to sglang /v1/completions."""
-    client = OpenAI(base_url=f"http://{server_address}/v1", api_key="None")
+    client = OpenAI(
+        base_url=f"http://{server_address}/v1",
+        api_key="None",
+        timeout=args.request_timeout,
+    )
 
     messages = data["conversations"]
     regenerated_messages = []
@@ -206,6 +230,35 @@ def call_sglang(
         data["error"] = "Data starts with an assistant message"
         return data
 
+    # Pre-validation: check for empty/invalid messages
+    valid_roles = {"system", "user", "assistant"}
+    for i, message in enumerate(messages):
+        role = message.get("role")
+        if role not in valid_roles:
+            data["status"] = "error"
+            data["error"] = f"Invalid message role at index {i}: {role}"
+            return data
+        content = message.get("content")
+        if role != "assistant" and (
+            content is None or (isinstance(content, str) and not content.strip())
+        ):
+            data["status"] = "error"
+            data["error"] = f"Empty content in {role} message at index {i}"
+            return data
+
+    # Context length guard
+    estimated_words = compute_context_length(messages)
+    if estimated_words > args.max_context_words:
+        data["status"] = "error"
+        data["error"] = (
+            f"Context too long: ~{estimated_words} words exceeds "
+            f"max of {args.max_context_words}"
+        )
+        return data
+
+    # Track reasoning_effort used (for gpt-oss output format)
+    last_reasoning_effort = None
+
     for message in messages:
         if message["role"] == "system":
             regenerated_messages.append(message)
@@ -215,6 +268,8 @@ def call_sglang(
             regenerated_messages.append(message)
 
             query_kwargs = build_query_kwargs(args, regenerated_messages, max_tokens)
+            if args.is_gpt_oss:
+                last_reasoning_effort = query_kwargs.get("reasoning_effort")
 
             try:
                 resp = client.chat.completions.create(**query_kwargs)
@@ -222,20 +277,39 @@ def call_sglang(
                 data["status"] = "error"
                 data["error"] = str(e)
                 return data
+
+            # Post-response validation
+            if not resp.choices:
+                data["status"] = "error"
+                data["error"] = "Empty response: no choices returned"
+                return data
+
             response_text = resp.choices[0].message.content
+            if not response_text:
+                data["status"] = "error"
+                data["error"] = "Empty response content from model"
+                return data
+
             resp_msg = {
                 "role": "assistant",
                 "content": response_text,
             }
+
+            # Always include thinking key in assistant messages
             if args.is_reasoning_model:
-                resp_msg["thinking"] = resp.choices[0].message.reasoning_content
+                thinking = getattr(
+                    resp.choices[0].message, "reasoning_content", None
+                )
+                resp_msg["thinking"] = thinking if thinking else None
+            else:
+                resp_msg["thinking"] = None
+
             regenerated_messages.append(resp_msg)
-        else:
-            data["status"] = "error"
-            data["error"] = f"Invalid message role: {message['role']}"
-            return data
+
     data["conversations"] = regenerated_messages
     data["status"] = "success"
+    if args.is_gpt_oss and last_reasoning_effort is not None:
+        data["reasoning_effort"] = last_reasoning_effort
     return data
 
 
@@ -250,6 +324,8 @@ def main():
     if args.max_tokens <= 0:
         raise ValueError("Max tokens must be greater than 0")
 
+    error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
+
     print(f"Configuration:")
     print(f"  Model path: {args.model}")
     print(f"  Max tokens: {args.max_tokens}")
@@ -259,27 +335,47 @@ def main():
     print(f"  Input file: {args.input_file_path}")
     print(f"  Output file: {args.output_file_path}")
     print(f"  Resume mode: {args.resume}")
+    print(f"  Retry failed: {args.retry_failed}")
     print("-" * 50)
-    total_lines = sum(1 for _ in open(args.input_file_path))
 
-    skip_lines = 0
-    error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
-
-    if args.resume and os.path.exists(args.output_file_path):
-        existing_success = sum(1 for _ in open(args.output_file_path))
-        existing_error = 0
-        if os.path.exists(error_file_path):
-            existing_error = sum(1 for _ in open(error_file_path))
-        skip_lines = existing_success + existing_error
-        print(f"Resume mode enabled:")
-        print(f"  Found {existing_success} successful samples in output file")
-        print(f"  Found {existing_error} error samples in error file")
-        print(f"  Skipping first {skip_lines} input samples")
-        print("-" * 50)
-
-        if skip_lines >= total_lines:
-            print(f"All {total_lines} samples already processed. Nothing to do.")
+    # --retry-failed: load error file as input, strip error metadata
+    if args.retry_failed:
+        if not os.path.exists(error_file_path):
+            print(f"No error file found at {error_file_path}. Nothing to retry.")
             return
+        retry_input_data = []
+        with open(error_file_path, "r") as ef:
+            for line in ef:
+                entry = json.loads(line.strip())
+                entry.pop("status", None)
+                entry.pop("error", None)
+                retry_input_data.append(entry)
+        if not retry_input_data:
+            print("Error file is empty. Nothing to retry.")
+            return
+        total_lines = len(retry_input_data)
+        print(f"Retry-failed mode: loaded {total_lines} failed samples from {error_file_path}")
+        print("-" * 50)
+        skip_lines = 0
+    else:
+        total_lines = sum(1 for _ in open(args.input_file_path))
+        skip_lines = 0
+
+        if args.resume and os.path.exists(args.output_file_path):
+            existing_success = sum(1 for _ in open(args.output_file_path))
+            existing_error = 0
+            if os.path.exists(error_file_path):
+                existing_error = sum(1 for _ in open(error_file_path))
+            skip_lines = existing_success + existing_error
+            print(f"Resume mode enabled:")
+            print(f"  Found {existing_success} successful samples in output file")
+            print(f"  Found {existing_error} error samples in error file")
+            print(f"  Skipping first {skip_lines} input samples")
+            print("-" * 50)
+
+            if skip_lines >= total_lines:
+                print(f"All {total_lines} samples already processed. Nothing to do.")
+                return
 
     # test all server addresses
     valid_server_addresses = []
@@ -305,13 +401,24 @@ def main():
     )
     print("-" * 50)
 
-    # Determine file open mode based on resume flag
-    file_mode = "a" if (args.resume and skip_lines > 0) else "w"
+    # Determine file open modes
+    if args.retry_failed:
+        # Retry mode: append successes to output, overwrite error file with new failures
+        output_file_mode = "a"
+        error_file_mode = "w"
+    elif args.resume and skip_lines > 0:
+        output_file_mode = "a"
+        error_file_mode = "a"
+    else:
+        output_file_mode = "w"
+        error_file_mode = "w"
+
     print(
         f"Regenerating dataset and saving the output to {args.output_file_path} and error log to {error_file_path}"
     )
     print(
-        f"File open mode: {file_mode} ({'append' if file_mode == 'a' else 'overwrite'})"
+        f"Output file mode: {output_file_mode} ({'append' if output_file_mode == 'a' else 'overwrite'}), "
+        f"Error file mode: {error_file_mode} ({'append' if error_file_mode == 'a' else 'overwrite'})"
     )
     print("-" * 50)
     context_token_sum = 0
@@ -320,11 +427,19 @@ def main():
     success_samples = 0
     error_samples = 0
 
+    # Build input iterator: either from retry data or from input file
+    if args.retry_failed:
+        input_data_iter = iter(retry_input_data)
+        input_file_ctx = open(os.devnull)  # placeholder, not used
+    else:
+        input_file_ctx = open(args.input_file_path, "r")
+        input_data_iter = None  # will be set below
+
     # Create progress bar
     with (
-        open(args.input_file_path, "r") as input_file,
-        open(args.output_file_path, file_mode) as output_file_handle,
-        open(error_file_path, file_mode) as error_file_handle,
+        input_file_ctx as input_file,
+        open(args.output_file_path, output_file_mode) as output_file_handle,
+        open(error_file_path, error_file_mode) as error_file_handle,
     ):
         executor = ThreadPoolExecutor(
             max_workers=args.concurrency * len(valid_server_addresses)
@@ -335,20 +450,23 @@ def main():
         pbar = tqdm(total=total_lines, desc="Processing", initial=skip_lines)
         start_server_index = 0
 
-        if skip_lines > 0:
+        if not args.retry_failed and skip_lines > 0:
             print(f"Skipping {skip_lines} already processed samples...")
             for _ in range(skip_lines):
                 next(input_file, None)
             print(f"Resuming from sample {skip_lines + 1}")
 
-        for line in input_file:
+        if args.retry_failed:
+            data_iterator = input_data_iter
+        else:
+            data_iterator = (json.loads(line.strip()) for line in input_file)
+
+        for data in data_iterator:
             if (
                 args.num_samples is not None
                 and success_samples + error_samples >= args.num_samples
             ):
                 break
-
-            data = json.loads(line.strip())
 
             # find server address with the least waiting requests
             server_address = valid_server_addresses[start_server_index]
@@ -360,12 +478,19 @@ def main():
                 # check if any future is done, if so, write the result to the output file
                 for req_future in waiting_queue[server_address]:
                     if req_future.done():
-                        regen_data = req_future.result()
+                        try:
+                            regen_data = req_future.result()
+                        except Exception as e:
+                            regen_data = {
+                                "status": "error",
+                                "error": f"Future execution error: {e}",
+                            }
 
                         if regen_data["status"] == "error":
                             error_file_handle.write(
                                 json.dumps(regen_data, ensure_ascii=False) + "\n"
                             )
+                            error_file_handle.flush()
                             error_samples += 1
                         else:
                             ctx_len = compute_context_length(
@@ -381,6 +506,7 @@ def main():
                             output_file_handle.write(
                                 json.dumps(regen_data, ensure_ascii=False) + "\n"
                             )
+                            output_file_handle.flush()
                             success_samples += 1
                         waiting_queue[server_address].remove(req_future)
                         finished_on_request = True
@@ -400,11 +526,18 @@ def main():
         # deal with all the remaining requests
         for server_address, waiting_queue_items in waiting_queue.items():
             for req_future in waiting_queue_items:
-                regen_data = req_future.result()
+                try:
+                    regen_data = req_future.result()
+                except Exception as e:
+                    regen_data = {
+                        "status": "error",
+                        "error": f"Future execution error: {e}",
+                    }
                 if regen_data["status"] == "error":
                     error_file_handle.write(
                         json.dumps(regen_data, ensure_ascii=False) + "\n"
                     )
+                    error_file_handle.flush()
                     error_samples += 1
                 else:
                     ctx_len = compute_context_length(
@@ -420,6 +553,7 @@ def main():
                     output_file_handle.write(
                         json.dumps(regen_data, ensure_ascii=False) + "\n"
                     )
+                    output_file_handle.flush()
                     success_samples += 1
 
     print(f"\nProcessing completed!")
@@ -434,7 +568,12 @@ def main():
         print("No successful examples to compute context length statistics.")
 
     total_processed = success_samples + error_samples
-    if skip_lines > 0:
+    if args.retry_failed:
+        print(f"\nRetry-failed completed!")
+        print(f"  Retried: {total_processed} previously failed samples")
+        print(f"  Now succeeded: {success_samples}")
+        print(f"  Still failing: {error_samples}")
+    elif skip_lines > 0:
         print(f"\nResume processing completed!")
         print(f"  Previously processed: {skip_lines}")
         print(
