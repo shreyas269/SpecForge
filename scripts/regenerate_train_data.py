@@ -260,7 +260,12 @@ def call_sglang(
         elif message["role"] == "user":
             regenerated_messages.append(message)
 
-            query_kwargs = build_query_kwargs(args, regenerated_messages, max_tokens)
+            # Strip extra fields (e.g. thinking) before sending as context
+            api_messages = [
+                {"role": m["role"], "content": m["content"]}
+                for m in regenerated_messages
+            ]
+            query_kwargs = build_query_kwargs(args, api_messages, max_tokens)
             if args.is_gpt_oss:
                 last_reasoning_effort = query_kwargs.get("reasoning_effort")
 
