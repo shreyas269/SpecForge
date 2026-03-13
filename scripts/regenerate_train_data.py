@@ -30,7 +30,6 @@ python scripts/regenerate_train_data.py \
 import argparse
 import json
 import os
-import random
 from concurrent.futures import ThreadPoolExecutor
 
 from typing import Any, Dict, List
@@ -57,6 +56,13 @@ def parse_arguments():
         "--is-gpt-oss",
         action="store_true",
         help="Whether the model is a GPT-OSS model",
+    )
+    model_group.add_argument(
+        "--reasoning-effort",
+        type=str,
+        default=None,
+        choices=["low", "medium", "high"],
+        help="Reasoning effort level for GPT-OSS models (requires --is-gpt-oss)",
     )
 
     # sampling params
@@ -151,19 +157,6 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def get_random_reasoning_effort() -> str:
-    """Get a random reasoning effort level for the model with weighted probabilities."""
-    # usage example: https://huggingface.co/openai/gpt-oss-20b/discussions/28
-    # Reasoning effort levels with weights: LOW(4), MEDIUM(4), HIGH(2)
-    reasoning_efforts = [
-        "low",
-        "medium",
-        "high",
-    ]
-    weights = [4, 4, 2]
-    return random.choices(reasoning_efforts, weights=weights, k=1)[0]
-
-
 def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
     """
     This is a rough estimate of the context length measured in untokenized
@@ -203,8 +196,8 @@ def build_query_kwargs(args, messages, max_tokens=None):
         extra_body["top_k"] = args.top_k
     if extra_body:
         query_kwargs["extra_body"] = extra_body
-    if args.is_gpt_oss:
-        query_kwargs["reasoning_effort"] = get_random_reasoning_effort()
+    if args.is_gpt_oss and args.reasoning_effort is not None:
+        query_kwargs["reasoning_effort"] = args.reasoning_effort
     return query_kwargs
 
 
