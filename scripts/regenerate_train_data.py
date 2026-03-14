@@ -30,6 +30,7 @@ python scripts/regenerate_train_data.py \
 import argparse
 import json
 import os
+import random
 from concurrent.futures import ThreadPoolExecutor
 
 from typing import Any, Dict, List
@@ -63,6 +64,16 @@ def parse_arguments():
         default=None,
         choices=["low", "medium", "high"],
         help="Reasoning effort level for GPT-OSS models (requires --is-gpt-oss)",
+    )
+    model_group.add_argument(
+        "--weighted-reasoning-effort",
+        type=float,
+        nargs=3,
+        metavar=("LOW", "MEDIUM", "HIGH"),
+        default=None,
+        help="Weights for randomly sampling reasoning effort per request. "
+        "Three floats for low/medium/high (e.g., 0.2 0.5 0.3). "
+        "Mutually exclusive with --reasoning-effort. Requires --is-gpt-oss.",
     )
 
     # sampling params
@@ -177,6 +188,14 @@ def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
     return length
 
 
+REASONING_EFFORT_LEVELS = ["low", "medium", "high"]
+
+
+def sample_reasoning_effort(weights):
+    """Sample a reasoning effort level based on the provided weights."""
+    return random.choices(REASONING_EFFORT_LEVELS, weights=weights, k=1)[0]
+
+
 def build_query_kwargs(args, messages, max_tokens=None):
     effective_max_tokens = max_tokens if max_tokens is not None else args.max_tokens
 
@@ -196,8 +215,13 @@ def build_query_kwargs(args, messages, max_tokens=None):
         extra_body["top_k"] = args.top_k
     if extra_body:
         query_kwargs["extra_body"] = extra_body
-    if args.is_gpt_oss and args.reasoning_effort is not None:
-        query_kwargs["reasoning_effort"] = args.reasoning_effort
+    if args.is_gpt_oss:
+        if args.weighted_reasoning_effort is not None:
+            query_kwargs["reasoning_effort"] = sample_reasoning_effort(
+                args.weighted_reasoning_effort
+            )
+        elif args.reasoning_effort is not None:
+            query_kwargs["reasoning_effort"] = args.reasoning_effort
     return query_kwargs
 
 
@@ -316,6 +340,13 @@ def main():
     args = parse_arguments()
 
     # Validate parameters
+    if args.reasoning_effort and args.weighted_reasoning_effort:
+        raise ValueError(
+            "--reasoning-effort and --weighted-reasoning-effort are mutually exclusive"
+        )
+    if args.weighted_reasoning_effort and not args.is_gpt_oss:
+        raise ValueError("--weighted-reasoning-effort requires --is-gpt-oss")
+
     if not (0.0 <= args.temperature <= 1.0):
         raise ValueError("Temperature must be between 0.0 and 1.0")
 
@@ -332,6 +363,9 @@ def main():
     print(f"  API URL: {args.server_address}")
     print(f"  Input file: {args.input_file_path}")
     print(f"  Output file: {args.output_file_path}")
+    if args.weighted_reasoning_effort:
+        wre = args.weighted_reasoning_effort
+        print(f"  Weighted reasoning effort: low={wre[0]}, medium={wre[1]}, high={wre[2]}")
     print(f"  Resume mode: {args.resume}")
     print(f"  Retry failed: {args.retry_failed}")
     print("-" * 50)
