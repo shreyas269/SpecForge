@@ -158,9 +158,81 @@ def normalize_ultrachat(dataset: Dataset, parser: Parser, idx_offset: int = 0, n
     return dataset.map(transform, with_indices=True, remove_columns=dataset.column_names, num_proc=num_proc)
 
 
+def format_harmony_conversation(conversation: list[dict], parser: HarmonyParser, reasoning_effort: str | None = None) -> str:
+    """Format a gpt-oss conversation with thinking/reasoning into harmony prompt format.
+
+    Converts the HF dataset format where assistant messages have a `thinking` field
+    into the harmony role format expected by HarmonyParser:
+      - thinking content  -> assistant_analysis
+      - message content   -> assistant_final
+      - reasoning_effort  -> assistant_reasoning_effort (system prompt)
+
+    Args:
+        conversation: list of message dicts with keys: role, content, thinking (nullable)
+        parser: HarmonyParser instance
+        reasoning_effort: reasoning effort level ("low", "medium", "high") or None
+    """
+    if not conversation:
+        return ""
+
+    prompt_text = ""
+
+    # Inject reasoning effort as system prompt
+    effort = reasoning_effort or parser.default_reasoning_level
+    prompt_text = parser.build_single_turn_prompt(
+        prompt_text, "assistant_reasoning_effort", effort
+    )
+
+    for message in conversation:
+        role = message.get("role", "")
+        content = message.get("content", "")
+        thinking = message.get("thinking")
+
+        if role == "system":
+            prompt_text = parser.build_single_turn_prompt(prompt_text, "system", content)
+        elif role == "user":
+            prompt_text = parser.build_single_turn_prompt(prompt_text, "user", content)
+        elif role == "assistant":
+            if thinking:
+                prompt_text = parser.build_single_turn_prompt(
+                    prompt_text, "assistant_analysis", thinking
+                )
+            prompt_text = parser.build_single_turn_prompt(
+                prompt_text, "assistant_final", content
+            )
+        else:
+            warnings.warn(f"Unknown role '{role}' in harmony conversation, skipping.")
+
+    return prompt_text
+
+
+def normalize_gpt_oss(dataset: Dataset, parser: Parser, idx_offset: int = 0, num_proc: int = 1) -> Dataset:
+    """Normalize gpt-oss dataset (e.g. baseten-admin/gpt-oss120b-generated-perfectblend).
+
+    Schema: conversation_id, conversations [{role, content, thinking}], reasoning_effort
+    We map to: id, idx, text (pre-formatted harmony string)
+    """
+    if not isinstance(parser, HarmonyParser):
+        raise ValueError("gpt-oss format requires --chat-template gpt-oss (HarmonyParser)")
+
+    def transform(example, index):
+        convos = example.get("conversations") or []
+        reasoning_effort = example.get("reasoning_effort")
+        text = format_harmony_conversation(convos, parser, reasoning_effort)
+
+        return {
+            "id": str(example.get("conversation_id", "")),
+            "idx": idx_offset + index,
+            "text": text,
+        }
+
+    return dataset.map(transform, with_indices=True, remove_columns=dataset.column_names, num_proc=num_proc)
+
+
 NORMALIZERS = {
     "sharegpt": normalize_sharegpt,
     "ultrachat": normalize_ultrachat,
+    "gpt-oss": normalize_gpt_oss,
 }
 
 
