@@ -67,8 +67,23 @@ print("=" * 60)
 print(prompt_text)
 print()
 
+# Convert to harmony roles for parser.parse()
+harmony_messages = []
+harmony_messages.append({"role": "assistant_reasoning_effort", "content": reasoning_effort})
+for message in record["conversations"]:
+    role = message["role"]
+    content = message["content"]
+    thinking = message.get("thinking")
+
+    if role == "assistant":
+        if thinking:
+            harmony_messages.append({"role": "assistant_analysis", "content": thinking})
+        harmony_messages.append({"role": "assistant_final", "content": content})
+    else:
+        harmony_messages.append({"role": role, "content": content})
+
 # Tokenize and show loss mask
-input_ids, loss_mask = parser.parse(record["conversations"], max_length=2048)
+input_ids, loss_mask = parser.parse(harmony_messages, max_length=2048)
 tokens = tokenizer.convert_ids_to_tokens(input_ids)
 
 print("=" * 60)
