@@ -18,7 +18,7 @@ import json
 import warnings
 from pathlib import Path
 
-from datasets import Dataset, concatenate_datasets
+from datasets import Dataset, concatenate_datasets, load_from_disk
 from transformers import AutoTokenizer
 
 from specforge.data.parse import GeneralParser, HarmonyParser, Parser, ThinkingParser
@@ -254,7 +254,13 @@ def merge_datasets(dataset_configs: list[dict], parser: Parser, num_proc: int = 
         fmt = config["format"]
 
         print(f"Loading {path} (format: {fmt})...")
-        ds = Dataset.from_file(path)
+        p = Path(path)
+        if p.is_dir():
+            ds = load_from_disk(path)
+        elif p.suffix == ".jsonl":
+            ds = Dataset.from_json(path)
+        else:
+            ds = Dataset.from_file(path)
         print(f"  Loaded {len(ds)} examples with columns: {ds.column_names}")
 
         normalizer = NORMALIZERS[fmt]
