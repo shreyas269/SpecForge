@@ -79,6 +79,8 @@ class OnlineDFlashModel(nn.Module):
     ):
         super().__init__()
         self.draft_model = draft_model
+        if hasattr(target_lm_head, 'weight') and hasattr(target_embed_tokens, 'weight') and target_lm_head.weight.data_ptr() == target_embed_tokens.weight.data_ptr():
+            target_lm_head.weight = nn.Parameter(target_embed_tokens.weight.clone(), requires_grad=False)
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
         self.block_size = block_size
