@@ -602,6 +602,20 @@ def main():
     accum_loss = 0.0  # running sum of loss across accumulation window
     accum_acc = 0.0
     accum_accept_len = 0.0
+    # Warm up the target model to trigger lazy NCCL communicator creation,
+    # Triton kernel compilation, and memory allocation on all nodes before
+    # the training loop. Without this, nodes that initialize slower cause
+    # FSDP's cross-node collectives to time out on the first step.
+    print_on_rank0("Warming up target model...")
+    warmup_data = next(iter(train_dataloader))
+    warmup_ids = warmup_data["input_ids"].cuda()
+    warmup_mask = warmup_data["attention_mask"].cuda()
+    warmup_loss = warmup_data["loss_mask"].cuda()
+    with torch.no_grad():
+        target_model.generate_dflash_data(warmup_ids, warmup_mask, warmup_loss)
+    dist.barrier()
+    print_on_rank0("Warmup complete, all ranks synchronized.")
+
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
 
     micro_step = 0
