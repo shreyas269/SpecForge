@@ -25,7 +25,7 @@ from datasets import Dataset, concatenate_datasets, load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.distributed import destroy_distributed, get_dp_group, get_tp_group, init_distributed
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.dflash_target_model import (
     DFlashTargetModel,
@@ -552,6 +552,7 @@ def main():
 
     dflash_model = FSDP(
         dflash_model,
+        process_group=get_dp_group(),
         use_orig_params=True,
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -634,6 +635,9 @@ def main():
             target_output = target_model.generate_dflash_data(
                 input_ids, attention_mask, loss_mask
             )
+            # Synchronize TP ranks after target model forward before FSDP operations
+            # to prevent deadlocks when TP and FSDP use different process groups
+            dist.barrier(get_tp_group())
             hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
             loss, accuracy, acceptance_length = dflash_model(
@@ -714,6 +718,7 @@ def main():
                             eval_target_output = target_model.generate_dflash_data(
                                 eval_input_ids, eval_attention_mask, eval_loss_mask
                             )
+                            dist.barrier(get_tp_group())
                             eval_hidden_states = eval_target_output.hidden_states.cuda()
 
                             eval_loss, eval_acc, eval_accept_len = dflash_model(
