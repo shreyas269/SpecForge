@@ -3,8 +3,9 @@
 """DFlash Training Script."""
 
 import argparse
+import contextlib
+import json
 import logging
-import math
 import os
 import shutil
 import time
@@ -20,11 +21,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
-from datasets import load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.distributed import destroy_distributed, get_dp_group, get_tp_group, init_distributed
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.dflash_target_model import (
     DFlashTargetModel,
@@ -86,7 +87,7 @@ def parse_args():
     )
 
     dataset_group = parser.add_argument_group("dataset")
-    dataset_group.add_argument("--train-data-path", type=str, required=True)
+    dataset_group.add_argument("--train-data-path", type=str, nargs="+", required=True)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
@@ -112,6 +113,14 @@ def parse_args():
         type=str,
         default=None,
         help="Directory of the checkpoint to resume training from",
+    )
+    training_group.add_argument(
+        "--reset-scheduler",
+        action="store_true",
+        help="When loading from --ckpt-dir, load optimizer Adam state (momentum) "
+        "but reset the LR scheduler for the new total_steps. "
+        "Useful for Phase 2 fine-tuning where you want to continue "
+        "optimizer momentum but start a fresh LR schedule.",
     )
 
     output_group = parser.add_argument_group("output")
@@ -194,29 +203,127 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     return target_model, draft_model
 
 
+def parse_data_path_with_fraction(raw_path: str) -> Tuple[str, float]:
+    """Parse a data path that may include a sampling fraction.
+
+    Supports the format: /path/to/data.jsonl::0.1
+    where 0.1 means use 10% of the dataset. Defaults to 1.0 (use all data).
+    """
+    if "::" in raw_path:
+        path, fraction_str = raw_path.rsplit("::", 1)
+        fraction = float(fraction_str)
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(
+                f"Sampling fraction must be in (0, 1], got {fraction} for {path}"
+            )
+        return path, fraction
+    return raw_path, 1.0
+
+
+def load_dataset_from_dir(path: str) -> Dataset:
+    """Load a dataset directory by reading state.json _data_files for fast arrow loading.
+
+    Falls back to load_dataset() if no state.json is found.
+    """
+    state_json_path = os.path.join(path, "state.json")
+    if os.path.exists(state_json_path):
+        with open(state_json_path, "r") as f:
+            state = json.load(f)
+        data_files = state.get("_data_files", [])
+        if data_files:
+            arrow_paths = [
+                os.path.join(path, entry["filename"])
+                for entry in data_files
+                if os.path.exists(os.path.join(path, entry["filename"]))
+            ]
+            if arrow_paths:
+                datasets = [Dataset.from_file(p) for p in arrow_paths]
+                ds = concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
+                print_on_rank0(
+                    f"Loaded {len(arrow_paths)} arrow file(s) from {path} via state.json"
+                )
+                return ds
+        print_on_rank0(
+            f"state.json found in {path} but no valid _data_files, falling back to load_dataset"
+        )
+
+    loaded = load_dataset(path)
+    if "train" in loaded:
+        return loaded["train"]
+    return next(iter(loaded.values()))
+
+
 def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
     """Build train and eval dataloaders."""
     import hashlib
 
     cache_params_string = (
-        f"{args.train_data_path}-"
+        f"{','.join(sorted(args.train_data_path))}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
         f"{args.target_model_path}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    train_eagle3_dataset = build_eagle3_dataset(
-        dataset=train_dataset,
-        tokenizer=tokenizer,
-        chat_template=args.chat_template,
-        max_length=args.max_length,
-        is_preformatted=args.is_preformatted,
-        cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-        cache_key=cache_key,
-        num_proc=args.build_dataset_num_proc,
-    )
+    # Parse paths and optional sampling fractions (e.g. "data.jsonl::0.1")
+    parsed_paths = [parse_data_path_with_fraction(p) for p in args.train_data_path]
+
+    arrow_file_entries = [(p, f) for p, f in parsed_paths if p.endswith(".arrow")]
+    arrow_dir_entries = [(p, f) for p, f in parsed_paths if os.path.isdir(p)]
+    json_entries = [
+        (p, f) for p, f in parsed_paths
+        if not p.endswith(".arrow") and not os.path.isdir(p)
+    ]
+
+    raw_datasets = []
+
+    for path, fraction in arrow_file_entries:
+        ds = Dataset.from_file(path)
+        if fraction < 1.0:
+            original_len = len(ds)
+            n_samples = max(1, int(original_len * fraction))
+            ds = ds.shuffle(seed=args.seed).select(range(n_samples))
+            print_on_rank0(f"Sampled {n_samples}/{original_len} ({fraction:.0%}) from {path}")
+        raw_datasets.append(ds)
+
+    for path, fraction in arrow_dir_entries:
+        ds = load_dataset_from_dir(path)
+        if fraction < 1.0:
+            original_len = len(ds)
+            n_samples = max(1, int(original_len * fraction))
+            ds = ds.shuffle(seed=args.seed).select(range(n_samples))
+            print_on_rank0(f"Sampled {n_samples}/{original_len} ({fraction:.0%}) from {path}")
+        raw_datasets.append(ds)
+
+    for path, fraction in json_entries:
+        ds = load_dataset("json", data_files=path)["train"]
+        if fraction < 1.0:
+            original_len = len(ds)
+            n_samples = max(1, int(original_len * fraction))
+            ds = ds.shuffle(seed=args.seed).select(range(n_samples))
+            print_on_rank0(f"Sampled {n_samples}/{original_len} ({fraction:.0%}) from {path}")
+        raw_datasets.append(ds)
+
+    # Preprocess each dataset separately (they may have different schemas),
+    # then concatenate the processed results.
+    processed_datasets = []
+    for i, ds in enumerate(raw_datasets):
+        ds_cache_key = f"{cache_key}_part{i}" if cache_key else None
+        ds_cache_dir = os.path.join(args.cache_dir, "processed_dataset") if cache_key else None
+        processed = build_eagle3_dataset(
+            dataset=ds,
+            tokenizer=tokenizer,
+            chat_template=args.chat_template,
+            max_length=args.max_length,
+            is_preformatted=args.is_preformatted,
+            cache_dir=ds_cache_dir,
+            cache_key=ds_cache_key,
+            num_proc=args.build_dataset_num_proc,
+        )
+        print_on_rank0(f"Preprocessed dataset {i}: {len(processed)} samples")
+        processed_datasets.append(processed)
+
+    train_eagle3_dataset = concatenate_datasets(processed_datasets)
 
     min_loss_tokens = 2 * args.block_size
     original_size = len(train_eagle3_dataset)
@@ -237,13 +344,26 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
 
     eval_dataloader = None
     if args.eval_data_path:
-        eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
+        eval_path = args.eval_data_path
+        if eval_path.endswith(".arrow"):
+            eval_dataset = Dataset.from_file(eval_path)
+        elif os.path.isdir(eval_path):
+            eval_dataset = load_dataset_from_dir(eval_path)
+        else:
+            eval_dataset = load_dataset("json", data_files=eval_path)["train"]
         eval_eagle3_dataset = build_eagle3_dataset(
             dataset=eval_dataset,
             tokenizer=tokenizer,
             chat_template=args.chat_template,
             max_length=args.max_length,
             is_preformatted=args.is_preformatted,
+        )
+        eval_original_size = len(eval_eagle3_dataset)
+        eval_eagle3_dataset = eval_eagle3_dataset.filter(
+            lambda x: x["loss_mask"].sum() >= min_loss_tokens
+        )
+        print_on_rank0(
+            f"Filtered eval dataset: {eval_original_size} -> {len(eval_eagle3_dataset)} samples"
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
@@ -256,7 +376,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     return train_dataloader, eval_dataloader
 
 
-def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
+def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer, total_micro_steps=0):
     """Save checkpoint."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
     if dist.get_rank() == 0:
@@ -276,6 +396,7 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
                 {
                     "epoch": epoch,
                     "global_step": step,
+                    "total_micro_steps": total_micro_steps,
                     "args": args,
                     **optimizer.state_dict(),
                 },
@@ -306,10 +427,11 @@ def record_metrics(
     loss: float,
     accuracy: float,
     global_step: int,
+    total_steps: int,
     tracker,
     optimizer,
-    train_dataloader=None,
     mode: str = "train",
+    acceptance_length: float = None,
 ) -> None:
     logdict = {}
 
@@ -318,9 +440,12 @@ def record_metrics(
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
+    if acceptance_length is not None:
+        logdict[f"{mode}/acceptance_length"] = acceptance_length
 
+    accept_str = f", AccLen: {acceptance_length:.2f}" if acceptance_length is not None else ""
     print_on_rank0(
-        f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
+        f"{mode.capitalize()} - Step {global_step}/{total_steps}, Loss: {loss:.4f}, Acc: {accuracy:.4f}{accept_str}"
     )
 
     tracker.log(logdict, step=global_step)
@@ -402,8 +527,7 @@ def main():
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
 
-    steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
-    total_steps = args.num_epochs * steps_per_epoch
+    total_steps = (args.num_epochs * len(train_dataloader)) // args.accumulation_steps
     print_on_rank0(f"Total training steps: {total_steps}")
 
     print_on_rank0("Loading target embeddings and head...")
@@ -428,10 +552,12 @@ def main():
 
     dflash_model = FSDP(
         dflash_model,
+        process_group=get_dp_group(),
         use_orig_params=True,
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )
@@ -447,25 +573,62 @@ def main():
 
     start_epoch = 0
     global_step = 0
+    total_micro_steps = 0
     if resume_state is not None:
-        optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
-        start_epoch = resume_state["epoch"]
-        global_step = resume_state["global_step"]
+        if args.reset_scheduler:
+            # Phase 2 fine-tuning: load Adam momentum but use fresh LR schedule
+            optimizer.optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+            print_on_rank0(
+                "Loaded optimizer Adam state (momentum) from checkpoint. "
+                "Scheduler reset for new training run."
+            )
+        else:
+            optimizer.load_state_dict(resume_state)
+            start_epoch = resume_state["epoch"]
+            global_step = resume_state["global_step"]
+            total_micro_steps = resume_state.get(
+                "total_micro_steps", global_step * args.accumulation_steps
+            )
+            print_on_rank0(f"Restored optimizer and scheduler, lr={optimizer.get_learning_rate():.6f}")
         del resume_state
-        print_on_rank0(f"Restored scheduler, lr={optimizer.get_learning_rate():.6f}")
 
-    skip_steps = global_step - start_epoch * len(train_dataloader)
+    skip_steps = max(0, total_micro_steps - start_epoch * len(train_dataloader))
 
     print_on_rank0(f"Initializing tracker (report_to={args.report_to})...")
     tracker = create_tracker(args, args.output_dir)
     print_on_rank0("Tracker initialized successfully.")
 
     last_time = time.time()
+    accum_loss = 0.0  # running sum of loss across accumulation window
+    accum_acc = 0.0
+    accum_accept_len = 0.0
+    # Warm up the target model to trigger lazy NCCL communicator creation,
+    # Triton kernel compilation, and memory allocation on all nodes before
+    # the training loop. Without this, nodes that initialize slower cause
+    # FSDP's cross-node collectives to time out on the first step.
+    print_on_rank0("Warming up target model...")
+    warmup_data = next(iter(train_dataloader))
+    warmup_ids = warmup_data["input_ids"].cuda()
+    warmup_mask = warmup_data["attention_mask"].cuda()
+    warmup_loss = warmup_data["loss_mask"].cuda()
+    with torch.no_grad():
+        target_model.generate_dflash_data(warmup_ids, warmup_mask, warmup_loss)
+    dist.barrier()
+    print_on_rank0("Warmup complete, all ranks synchronized.")
+
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
 
+    micro_step = 0
     for epoch in range(start_epoch, args.num_epochs):
         train_dataloader.sampler.set_epoch(epoch)
-        draft_model.train()
+        # Discard any partial accumulation from previous epoch
+        if micro_step != 0:
+            dflash_model.zero_grad(set_to_none=True)
+            micro_step = 0
+            accum_loss = 0.0
+            accum_acc = 0.0
+            accum_accept_len = 0.0
+        dflash_model.train()
 
         if dist.get_rank() == 0:
             progress_bar = tqdm(
@@ -477,7 +640,8 @@ def main():
         for step_in_epoch, data in enumerate(progress_bar):
             if epoch == start_epoch and step_in_epoch < skip_steps:
                 continue
-            global_step += 1
+            total_micro_steps += 1
+            micro_step += 1
 
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
@@ -485,37 +649,25 @@ def main():
             target_output = target_model.generate_dflash_data(
                 input_ids, attention_mask, loss_mask
             )
+            # Synchronize TP ranks after target model forward before FSDP operations
+            # to prevent deadlocks when TP and FSDP use different process groups
+            dist.barrier(get_tp_group())
             hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
 
-            loss, accuracy = dflash_model(
+            loss, accuracy, acceptance_length = dflash_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
             )
 
-            (loss / args.accumulation_steps).backward()
+            accum_loss += loss.detach() / args.accumulation_steps
+            accum_acc += accuracy.detach() / args.accumulation_steps
+            accum_accept_len += acceptance_length.detach() / args.accumulation_steps
 
-            if global_step % args.accumulation_steps == 0:
-                optimizer.step()
-
-            if global_step % args.log_interval == 0:
-                loss_log = loss.clone()
-                acc_log = accuracy.clone()
-                dist.all_reduce(loss_log)
-                dist.all_reduce(acc_log)
-                loss_log = loss_log / dist.get_world_size()
-                acc_log = acc_log / dist.get_world_size()
-
-                record_metrics(
-                    args,
-                    loss_log.item(),
-                    acc_log.item(),
-                    global_step,
-                    tracker,
-                    optimizer,
-                    train_dataloader,
-                    mode="train",
-                )
+            is_accumulating = micro_step % args.accumulation_steps != 0
+            sync_context = dflash_model.no_sync if is_accumulating else contextlib.nullcontext
+            with sync_context():
+                (loss / args.accumulation_steps).backward()
 
             if dist.get_rank() == 0:
                 elapsed = time.time() - last_time
@@ -524,17 +676,113 @@ def main():
                     {
                         "loss": f"{loss.item():.4f}",
                         "acc": f"{accuracy.item():.4f}",
+                        "accept_len": f"{acceptance_length.item():.2f}",
                         "iter_time": f"{elapsed:.2f}s",
                     }
                 )
 
-            if global_step % args.save_interval == 0:
-                save_checkpoint(
-                    args, epoch, global_step, dflash_model, draft_model, optimizer
-                )
+            if not is_accumulating:
+                optimizer.step()
+                global_step += 1
+                micro_step = 0
+
+                if global_step % args.log_interval == 0:
+                    dp_group = get_dp_group()
+                    dp_world_size = dist.get_world_size(dp_group)
+                    loss_log = accum_loss.clone()
+                    acc_log = accum_acc.clone()
+                    accept_len_log = accum_accept_len.clone()
+                    dist.all_reduce(loss_log, group=dp_group)
+                    dist.all_reduce(acc_log, group=dp_group)
+                    dist.all_reduce(accept_len_log, group=dp_group)
+                    loss_log = loss_log / dp_world_size
+                    acc_log = acc_log / dp_world_size
+                    accept_len_log = accept_len_log / dp_world_size
+
+                    record_metrics(
+                        args,
+                        loss_log.item(),
+                        acc_log.item(),
+                        global_step,
+                        total_steps,
+                        tracker,
+                        optimizer,
+                        mode="train",
+                        acceptance_length=accept_len_log.item(),
+                    )
+
+                if (
+                    eval_dataloader is not None
+                    and global_step % args.eval_interval == 0
+                ):
+                    dflash_model.eval()
+                    eval_losses = []
+                    eval_accs = []
+                    eval_accept_lens = []
+
+                    for eval_data in tqdm(
+                        eval_dataloader,
+                        desc=f"Evaluating Epoch {epoch}",
+                        disable=dist.get_rank() != 0,
+                    ):
+                        with torch.no_grad():
+                            eval_input_ids = eval_data["input_ids"].cuda()
+                            eval_attention_mask = eval_data["attention_mask"].cuda()
+                            eval_loss_mask = eval_data["loss_mask"].cuda()
+                            eval_target_output = target_model.generate_dflash_data(
+                                eval_input_ids, eval_attention_mask, eval_loss_mask
+                            )
+                            dist.barrier(get_tp_group())
+                            eval_hidden_states = eval_target_output.hidden_states.cuda()
+
+                            eval_loss, eval_acc, eval_accept_len = dflash_model(
+                                input_ids=eval_input_ids,
+                                hidden_states=eval_hidden_states,
+                                loss_mask=eval_loss_mask,
+                            )
+                            eval_losses.append(eval_loss)
+                            eval_accs.append(eval_acc)
+                            eval_accept_lens.append(eval_accept_len)
+
+                    avg_eval_loss = torch.stack(eval_losses).mean()
+                    avg_eval_acc = torch.stack(eval_accs).mean()
+                    avg_eval_accept_len = torch.stack(eval_accept_lens).mean()
+                    dp_group = get_dp_group()
+                    dp_world_size = dist.get_world_size(dp_group)
+                    dist.all_reduce(avg_eval_loss, group=dp_group)
+                    dist.all_reduce(avg_eval_acc, group=dp_group)
+                    dist.all_reduce(avg_eval_accept_len, group=dp_group)
+                    avg_eval_loss = avg_eval_loss / dp_world_size
+                    avg_eval_acc = avg_eval_acc / dp_world_size
+                    avg_eval_accept_len = avg_eval_accept_len / dp_world_size
+
+                    record_metrics(
+                        args,
+                        avg_eval_loss.item(),
+                        avg_eval_acc.item(),
+                        global_step,
+                        total_steps,
+                        tracker,
+                        optimizer=None,
+                        mode="eval",
+                        acceptance_length=avg_eval_accept_len.item(),
+                    )
+
+                    dflash_model.train()
+
+                if global_step % args.save_interval == 0:
+                    save_checkpoint(
+                        args, epoch, global_step, dflash_model, draft_model, optimizer,
+                        total_micro_steps=total_micro_steps,
+                    )
+
+                accum_loss = 0.0
+                accum_acc = 0.0
+                accum_accept_len = 0.0
 
     save_checkpoint(
-        args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
+        args, args.num_epochs, global_step, dflash_model, draft_model, optimizer,
+        total_micro_steps=total_micro_steps,
     )
 
     tracker.close()
